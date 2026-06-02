@@ -1,5 +1,6 @@
 import os
 import base64
+import hashlib  # Used to calculate unique file fingerprints (MD5)
 import streamlit as st
 import pandas as pd
 from typing import List, Union
@@ -11,11 +12,11 @@ from google.genai import types
 from openai import OpenAI
 
 # =====================================================================
-# 1. STRUCTURE BLUEPRINTS (Schemas)
+# 1. STRUCTURE BLUEPRINTS (Universal Data Schemas)
 # =====================================================================
 
-# --- Invoice Data Structures ---
-class InvoiceLineItem(BaseModel):
+# --- 1A. Purchase Invoice Data Structures ---
+class PurchaseLineItem(BaseModel):
     item_name: str = Field(description="The description or name of the product or service")
     quantity: float = Field(default=0.0, description="The quantity purchased")
     rate: float = Field(default=0.0, description="The unit price or rate per item")
@@ -24,15 +25,15 @@ class InvoiceLineItem(BaseModel):
     sgst_amount: float = Field(default=0.0, description="SGST tax component amount")
     igst_amount: float = Field(default=0.0, description="IGST tax component amount")
 
-class InvoiceData(BaseModel):
-    supplier_name: str = Field(description="The company issuing the invoice")
-    invoice_number: str = Field(description="The unique invoice number")
+class PurchaseInvoiceData(BaseModel):
+    supplier_name: str = Field(description="The company issuing the invoice (seller/supplier)")
+    invoice_number: str = Field(description="The unique purchase invoice number")
     invoice_date: str = Field(description="The date issued (YYYY-MM-DD)")
-    line_items: List[InvoiceLineItem] = Field(description="List of items billed")
+    line_items: List[PurchaseLineItem] = Field(description="List of items billed")
     total_amount: float = Field(description="The final total amount payable")
 
 
-# --- Bank Statement Data Structures (New Add-on) ---
+# --- 1B. Bank Statement Data Structures ---
 class BankTransactionRow(BaseModel):
     transaction_date: str = Field(description="The date of the transaction (YYYY-MM-DD format if possible)")
     particulars: str = Field(description="The description, particulars, or narration of the transaction")
@@ -45,12 +46,29 @@ class BankStatementData(BaseModel):
     bank_name: str = Field(description="Name of the banking institution")
     transactions: List[BankTransactionRow] = Field(description="Chronological list of all transaction rows found in the statement")
 
+
+# --- 1C. Sale Invoice Data Structures ---
+class SaleLineItem(BaseModel):
+    item_name: str = Field(description="The description or name of the product or service sold")
+    quantity: float = Field(default=0.0, description="The quantity sold")
+    rate: float = Field(default=0.0, description="The unit price or rate charged per item")
+    item_amount: float = Field(default=0.0, description="Total amount for this item before tax")
+    igst_amount: float = Field(default=0.0, description="IGST tax component amount")
+    cgst_amount: float = Field(default=0.0, description="CGST tax component amount")
+    sgst_amount: float = Field(default=0.0, description="SGST tax component amount")
+
+class SaleInvoiceData(BaseModel):
+    invoice_date: str = Field(description="The date the sale invoice was issued (YYYY-MM-DD)")
+    invoice_number: str = Field(description="The unique sale invoice number")
+    buyer_name: str = Field(description="The name of the customer or buyer receiving the invoice")
+    buyer_gst_number: str = Field(default="", description="The GSTIN/GST number of the buyer or customer. Leave blank if not available.")
+    line_items: List[SaleLineItem] = Field(description="List of items sold in this sale bill")
+    total_amount: float = Field(description="The grand total amount of the sale invoice including all taxes")
+
 # =====================================================================
 # 2. UNIFIED AI PROCESSING ENGINES
 # =====================================================================
-
 def extract_with_gemini(uploaded_file, api_key: str, target_schema, system_instruction: str):
-    """Universal processing engine for Google Gemini AI"""
     os.environ["GEMINI_API_KEY"] = api_key
     client = genai.Client()
     
@@ -67,14 +85,12 @@ def extract_with_gemini(uploaded_file, api_key: str, target_schema, system_instr
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=target_schema,
-            temperature=0.0, # Complete analytical stability
+            temperature=0.0,
         ),
     )
     return target_schema.model_validate_json(response.text)
 
-
 def extract_with_openai(uploaded_file, api_key: str, target_schema, system_instruction: str):
-    """Universal processing engine for OpenAI GPT-4o"""
     client = OpenAI(api_key=api_key)
     
     ext = os.path.splitext(uploaded_file.name)[1].lower()
@@ -83,6 +99,7 @@ def extract_with_openai(uploaded_file, api_key: str, target_schema, system_instr
     file_bytes = uploaded_file.getvalue()
     base64_image = base64.b64encode(file_bytes).decode('utf-8')
     
+    # --- TYPO FIXED HERE ON LINE 107 ---
     response = client.beta.chat.completions.parse(
         model="gpt-4o",
         messages=[
@@ -99,15 +116,10 @@ def extract_with_openai(uploaded_file, api_key: str, target_schema, system_instr
     )
     return response.choices[0].message.parsed
 
-# =====================================================================
-# 3. DATA TABULARIZATION LAYER
-# =====================================================================
-
 def compile_to_dataframe(extracted_data_list, mode: str) -> pd.DataFrame:
-    """Dynamically shapes matrix rows depending on document processing execution mode."""
     rows = []
     
-    if mode == "Invoices":
+    if mode == "Purchase Invoices":
         for inv in extracted_data_list:
             for item in inv.line_items:
                 rows.append({
@@ -123,7 +135,7 @@ def compile_to_dataframe(extracted_data_list, mode: str) -> pd.DataFrame:
                     "IGST Amount": item.igst_amount,
                     "Total Invoice Amount": inv.total_amount
                 })
-    
+                
     elif mode == "Bank Statements":
         for statement in extracted_data_list:
             for tx in statement.transactions:
@@ -137,16 +149,32 @@ def compile_to_dataframe(extracted_data_list, mode: str) -> pd.DataFrame:
                     "Closing Balance": tx.closing_balance
                 })
                 
+    elif mode == "Sale Invoices":
+        for sale in extracted_data_list:
+            for item in sale.line_items:
+                rows.append({
+                    "Invoice Date": sale.invoice_date,
+                    "Invoice Number": sale.invoice_number,
+                    "Buyer Name": sale.buyer_name,
+                    "Buyer GST Number": sale.buyer_gst_number,
+                    "Item Name": item.item_name,
+                    "Quantity": item.quantity,
+                    "Rate": item.rate,
+                    "Item Amount": item.item_amount,
+                    "IGST Amount": item.igst_amount,
+                    "CGST Amount": item.cgst_amount,
+                    "SGST Amount": item.sgst_amount,
+                    "Total Amount": sale.total_amount
+                })
+                
     return pd.DataFrame(rows)
 
 # =====================================================================
-# 4. STREAMLIT USER INTERFACE DESIGN
+# 3. STREAMLIT USER INTERFACE DESIGN
 # =====================================================================
 st.set_page_config(page_title="Universal AI Data Extractor", page_icon="📊", layout="wide")
-
 st.title("📊 Multi-Format AI Intelligent Data Processing Platform")
 
-# Initialize cross-session states
 if "platform_choice" not in st.session_state:
     st.session_state["platform_choice"] = None
 if "saved_key" not in st.session_state:
@@ -175,18 +203,15 @@ if not st.session_state["saved_key"]:
 
 # --- CORE PROCESSING INTERFACE ---
 else:
-    # Sidebar control module
     with st.sidebar:
         st.success(f"🔒 AI Engine Status: ACTIVE")
         st.info(f"Vendor: {st.session_state['platform_choice']}")
-        
         st.markdown("---")
         st.subheader("📁 Processing Profile Configuration")
         
-        # New selection dropdown for data transformation target
         doc_mode = st.selectbox(
             "Select Document Data Source Profile:",
-            ["Invoices", "Bank Statements"]
+            ["Purchase Invoices", "Bank Statements", "Sale Invoices"]
         )
         
         st.markdown("---")
@@ -196,9 +221,8 @@ else:
             st.rerun()
 
     st.markdown(f"### Active Mode: **{doc_mode} Extraction Execution Workspace**")
-    st.write(f"Drop your target files below. The platform will automatically enforce the corresponding structure schemas via the active cloud models.")
-
-    # File Uploader
+    st.write(f"Drop your files below. The platform will automatically extract, format, and structure your data to match your requirements.")
+    
     uploaded_files = st.file_uploader(
         f"Drag and drop your {doc_mode} documents here:", 
         type=["pdf", "png", "jpg", "jpeg"], 
@@ -210,28 +234,42 @@ else:
         
         if st.button(f"🚀 Execute Batch {doc_mode} Extraction", type="primary"):
             all_parsed_data = []
+            processed_file_hashes = {}  # Local cache tracking fingerprints
             
             progress_bar = st.progress(0)
             status_text = st.empty()
             
-            # Setup prompt routing logic based on user selected mode
-            if doc_mode == "Invoices":
-                chosen_schema = InvoiceData
-                prompt_instruction = "Extract all matching lines seamlessly. Mark unrecorded tax values as 0.0."
-            else:
+            if doc_mode == "Purchase Invoices":
+                chosen_schema = PurchaseInvoiceData
+                prompt_instruction = "Extract all matching lines seamlessly. Identify the vendor/seller as supplier_name. Mark unrecorded tax values as 0.0."
+            elif doc_mode == "Bank Statements":
                 chosen_schema = BankStatementData
                 prompt_instruction = "Extract every single transaction item sequentially from the statement ledger. Do not skip any rows. Parse data precisely into the schema formats."
+            elif doc_mode == "Sale Invoices":
+                chosen_schema = SaleInvoiceData
+                prompt_instruction = "Extract details from this sale bill/invoice. Look for the Customer or Buyer name and assign it to buyer_name. Identify the buyer's GSTIN/GST number for buyer_gst_number. Extract item grids carefully. Mark absent tax values as 0.0."
 
-            # Execution loop over the document batch
             for index, file in enumerate(uploaded_files):
+                file_bytes = file.getvalue()
+                file_hash = hashlib.md5(file_bytes).hexdigest()
+                
+                if file_hash in processed_file_hashes:
+                    status_text.text(f"🛑 Skipped Duplicate File: {file.name}")
+                    st.warning(f"⚠️ **{file.name}** is a duplicate file. Re-used previous extraction data to save tokens.")
+                    all_parsed_data.append(processed_file_hashes[file_hash])
+                    progress_bar.progress((index + 1) / len(uploaded_files))
+                    continue
+                
                 status_text.text(f"AI parsing document ({index+1}/{len(uploaded_files)}): {file.name}...")
                 try:
                     if "Gemini" in st.session_state["platform_choice"]:
                         result = extract_with_gemini(file, st.session_state["saved_key"], chosen_schema, prompt_instruction)
                     else:
                         result = extract_with_openai(file, st.session_state["saved_key"], chosen_schema, prompt_instruction)
-                        
+                    
                     all_parsed_data.append(result)
+                    processed_file_hashes[file_hash] = result
+                    
                 except Exception as e:
                     st.error(f"Error handling processing pipeline on '{file.name}': {e}")
                 
@@ -240,14 +278,15 @@ else:
             status_text.text("✨ Conversions complete! Structuring master data reports...")
             
             if all_parsed_data:
-                # Direct conversion using structured compilation matrix routines
                 final_df = compile_to_dataframe(all_parsed_data, doc_mode)
                 
+                if doc_mode in ["Purchase Invoices", "Sale Invoices"] and not final_df.empty:
+                    final_df.drop_duplicates(inplace=True)
+
                 st.success(f"🎉 Integrated {doc_mode} Ledger Master Report Generated Successfully!")
                 st.subheader("📋 Consolidated Live Preview Window")
                 st.dataframe(final_df, use_container_width=True)
                 
-                # Excel buffering
                 import io
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
