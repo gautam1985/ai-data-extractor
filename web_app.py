@@ -99,7 +99,6 @@ def extract_with_openai(uploaded_file, api_key: str, target_schema, system_instr
     file_bytes = uploaded_file.getvalue()
     base64_image = base64.b64encode(file_bytes).decode('utf-8')
     
-    # --- TYPO FIXED HERE ON LINE 107 ---
     response = client.beta.chat.completions.parse(
         model="gpt-4o",
         messages=[
@@ -121,6 +120,8 @@ def compile_to_dataframe(extracted_data_list, mode: str) -> pd.DataFrame:
     
     if mode == "Purchase Invoices":
         for inv in extracted_data_list:
+            # Track if this is the first item loop for this specific invoice voucher
+            is_first_row = True
             for item in inv.line_items:
                 rows.append({
                     "Supplier Name": inv.supplier_name,
@@ -133,8 +134,10 @@ def compile_to_dataframe(extracted_data_list, mode: str) -> pd.DataFrame:
                     "CGST Amount": item.cgst_amount,
                     "SGST Amount": item.sgst_amount,
                     "IGST Amount": item.igst_amount,
-                    "Total Invoice Amount": inv.total_amount
+                    # Write total amount only on row #1, otherwise leave blank for Tally voucher maps
+                    "Total Invoice Amount": inv.total_amount if is_first_row else None
                 })
+                is_first_row = False
                 
     elif mode == "Bank Statements":
         for statement in extracted_data_list:
@@ -151,6 +154,8 @@ def compile_to_dataframe(extracted_data_list, mode: str) -> pd.DataFrame:
                 
     elif mode == "Sale Invoices":
         for sale in extracted_data_list:
+            # Track if this is the first item loop for this specific invoice voucher
+            is_first_row = True
             for item in sale.line_items:
                 rows.append({
                     "Invoice Date": sale.invoice_date,
@@ -164,8 +169,10 @@ def compile_to_dataframe(extracted_data_list, mode: str) -> pd.DataFrame:
                     "IGST Amount": item.igst_amount,
                     "CGST Amount": item.cgst_amount,
                     "SGST Amount": item.sgst_amount,
-                    "Total Amount": sale.total_amount
+                    # Fixed for Tally: Write total amount on row #1 only, keep subsequent item lines completely blank
+                    "Total Amount": sale.total_amount if is_first_row else None
                 })
+                is_first_row = False
                 
     return pd.DataFrame(rows)
 
@@ -280,8 +287,9 @@ else:
             if all_parsed_data:
                 final_df = compile_to_dataframe(all_parsed_data, doc_mode)
                 
-                if doc_mode in ["Purchase Invoices", "Sale Invoices"] and not final_df.empty:
-                    final_df.drop_duplicates(inplace=True)
+                # Note: We do not call drop_duplicates on the whole dataframe here,
+                # because the line items themselves are distinct. Our compile logic
+                # handles voucher total safety cleanly.
 
                 st.success(f"🎉 Integrated {doc_mode} Ledger Master Report Generated Successfully!")
                 st.subheader("📋 Consolidated Live Preview Window")
