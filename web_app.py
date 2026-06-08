@@ -1,6 +1,8 @@
 import os
 import base64
 import hashlib  # Used to calculate unique file fingerprints (MD5)
+import sqlite3  # Persistent relational local database connection engine
+import json
 import streamlit as st
 import pandas as pd
 from typing import List, Union
@@ -10,6 +12,54 @@ from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 from openai import OpenAI
+
+DB_FILE = "extraction_cache.db"
+
+# =====================================================================
+# 0. DATABASE PERSISTENCE LAYER INFRASTRUCTURE
+# =====================================================================
+def init_db():
+    """Initializes the SQLite database table schema if it doesn't exist yet."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS extraction_cache (
+            file_hash TEXT PRIMARY KEY,
+            file_name TEXT,
+            doc_mode TEXT,
+            extracted_json TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def get_cached_extraction(file_hash: str, doc_mode: str):
+    """Checks the database to see if this file has already been successfully extracted."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT extracted_json FROM extraction_cache WHERE file_hash = ? AND doc_mode = ?", 
+        (file_hash, doc_mode)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return row[0]  # Returns the raw JSON string cached from the previous run
+    return None
+
+def save_extraction_to_db(file_hash: str, file_name: str, doc_mode: str, extracted_json_str: str):
+    """Persistently saves successful AI extractions to prevent token loss if a crash occurs."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT OR REPLACE INTO extraction_cache (file_hash, file_name, doc_mode, extracted_json)
+        VALUES (?, ?, ?, ?)
+    """, (file_hash, file_name, doc_mode, extracted_json_str))
+    conn.commit()
+    conn.close()
+
+# Initialize the database immediately on launch
+init_db()
 
 # =====================================================================
 # 1. STRUCTURE BLUEPRINTS (Universal Data Schemas)
@@ -68,7 +118,45 @@ class SaleInvoiceData(BaseModel):
 # =====================================================================
 # 2. UNIFIED AI PROCESSING ENGINES
 # =====================================================================
-def extract_with_gemini(uploaded_file, api_key: str, target_schema, system_instruction: str):
+def run_gatekeeper_check(uploaded_file, api_key: str, selected_mode: str) -> str:
+    """Pre-screens a document quickly to match its format layout against the user selection."""
+    ext = os.path.splitext(uploaded_file.name)[1].lower()
+    mime_type = "application/pdf" if ext == ".pdf" else f"image/{ext.replace('.', '')}"
+    file_bytes = uploaded_file.getvalue()
+    
+    instruction = (
+        "Analyze this document image or file structure very quickly. Classify its format type. "
+        "Return EXACTLY one word from these options: 'Invoice' or 'Bank Statement'. "
+        "Do not include any punctuation, descriptions, or formatting."
+    )
+    
+    if "Gemini" in st.session_state["platform_choice"]:
+        os.environ["GEMINI_API_KEY"] = api_key
+        client = genai.Client()
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime_type), instruction]
+        )
+        return response.text.strip()
+    else:
+        client = OpenAI(api_key=api_key)
+        base64_image = base64.b64encode(file_bytes).decode('utf-8')
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",  # Using a super-fast mini model for screening to save money
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": instruction},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}}
+                    ],
+                }
+            ],
+            temperature=0.0
+        )
+        return response.choices[0].message.content.strip()
+
+def extract_with_gemini(uploaded_file, api_key: str, target_schema, system_instruction: str) -> str:
     os.environ["GEMINI_API_KEY"] = api_key
     client = genai.Client()
     
@@ -88,9 +176,9 @@ def extract_with_gemini(uploaded_file, api_key: str, target_schema, system_instr
             temperature=0.0,
         ),
     )
-    return target_schema.model_validate_json(response.text)
+    return response.text  # Return pure JSON string
 
-def extract_with_openai(uploaded_file, api_key: str, target_schema, system_instruction: str):
+def extract_with_openai(uploaded_file, api_key: str, target_schema, system_instruction: str) -> str:
     client = OpenAI(api_key=api_key)
     
     ext = os.path.splitext(uploaded_file.name)[1].lower()
@@ -113,14 +201,14 @@ def extract_with_openai(uploaded_file, api_key: str, target_schema, system_instr
         response_format=target_schema,
         temperature=0.0
     )
-    return response.choices[0].message.parsed
+    return response.choices[0].message.content  # Return pure JSON string
 
 def compile_to_dataframe(extracted_data_list, mode: str) -> pd.DataFrame:
     rows = []
     
     if mode == "Purchase Invoices":
-        for inv in extracted_data_list:
-            # Track if this is the first item loop for this specific invoice voucher
+        for inv_data in extracted_data_list:
+            inv = PurchaseInvoiceData.model_validate_json(inv_data) if isinstance(inv_data, str) else inv_data
             is_first_row = True
             for item in inv.line_items:
                 rows.append({
@@ -134,13 +222,13 @@ def compile_to_dataframe(extracted_data_list, mode: str) -> pd.DataFrame:
                     "CGST Amount": item.cgst_amount,
                     "SGST Amount": item.sgst_amount,
                     "IGST Amount": item.igst_amount,
-                    # Write total amount only on row #1, otherwise leave blank for Tally voucher maps
                     "Total Invoice Amount": inv.total_amount if is_first_row else None
                 })
                 is_first_row = False
                 
     elif mode == "Bank Statements":
-        for statement in extracted_data_list:
+        for stmt_data in extracted_data_list:
+            statement = BankStatementData.model_validate_json(stmt_data) if isinstance(stmt_data, str) else stmt_data
             for tx in statement.transactions:
                 rows.append({
                     "Bank Name": statement.bank_name,
@@ -153,8 +241,8 @@ def compile_to_dataframe(extracted_data_list, mode: str) -> pd.DataFrame:
                 })
                 
     elif mode == "Sale Invoices":
-        for sale in extracted_data_list:
-            # Track if this is the first item loop for this specific invoice voucher
+        for sale_data in extracted_data_list:
+            sale = SaleInvoiceData.model_validate_json(sale_data) if isinstance(sale_data, str) else sale_data
             is_first_row = True
             for item in sale.line_items:
                 rows.append({
@@ -169,7 +257,6 @@ def compile_to_dataframe(extracted_data_list, mode: str) -> pd.DataFrame:
                     "IGST Amount": item.igst_amount,
                     "CGST Amount": item.cgst_amount,
                     "SGST Amount": item.sgst_amount,
-                    # Fixed for Tally: Write total amount on row #1 only, keep subsequent item lines completely blank
                     "Total Amount": sale.total_amount if is_first_row else None
                 })
                 is_first_row = False
@@ -186,6 +273,8 @@ if "platform_choice" not in st.session_state:
     st.session_state["platform_choice"] = None
 if "saved_key" not in st.session_state:
     st.session_state["saved_key"] = ""
+if "confirmed_execution" not in st.session_state:
+    st.session_state["confirmed_execution"] = False
 
 # --- LOGIN CONTROL DESK ---
 if not st.session_state["saved_key"]:
@@ -228,7 +317,7 @@ else:
             st.rerun()
 
     st.markdown(f"### Active Mode: **{doc_mode} Extraction Execution Workspace**")
-    st.write(f"Drop your files below. The platform will automatically extract, format, and structure your data to match your requirements.")
+    st.write(f"Drop your files below. The platform will automatically check layout profiles, protect token budgets, and record to database logs.")
     
     uploaded_files = st.file_uploader(
         f"Drag and drop your {doc_mode} documents here:", 
@@ -236,13 +325,51 @@ else:
         accept_multiple_files=True
     )
 
+    # --- GATEKEEPER CONFIRMATION MODAL POPUP ---
+    @st.dialog("⚠️ Format Mismatch Warning Detection Notification")
+    def show_gatekeeper_warning(detected_format, user_mode):
+        st.error(f"**Gatekeeper Alert:** You have selected **'{user_mode}'** profile panel configuration.")
+        st.warning(f"However, our system layout analysis reveals your uploaded file is an **'{detected_format}'** format.")
+        st.write("Executing this mismatch could lead to damaged outputs or wasted token expenses.")
+        st.markdown("Would you like to enforce processing execution anyway?")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            # FIXED: Changed type from "danger" to "primary" to match Streamlit API specs
+            if st.button("Proceed Regardless", type="primary", use_container_width=True):
+                st.session_state["confirmed_execution"] = True
+                st.rerun()
+        with col2:
+            if st.button("Cancel & Halt Process", type="secondary", use_container_width=True):
+                st.session_state["confirmed_execution"] = False
+                st.rerun()
+
     if uploaded_files:
         st.info(f"📂 Cached {len(uploaded_files)} source files inside extraction stream.")
         
-        if st.button(f"🚀 Execute Batch {doc_mode} Extraction", type="primary"):
-            all_parsed_data = []
-            processed_file_hashes = {}  # Local cache tracking fingerprints
+        trigger_extraction = st.button(f"🚀 Execute Batch {doc_mode} Extraction", type="primary")
+        
+        # Trigger point evaluation sequence
+        if trigger_extraction or st.session_state["confirmed_execution"]:
             
+            # --- GATEKEEPER EVALUATION PIPELINE ---
+            if not st.session_state["confirmed_execution"]:
+                with st.spinner("Gatekeeper performing core document profile structural layout mapping..."):
+                    detected = run_gatekeeper_check(uploaded_files[0], st.session_state["saved_key"], doc_mode)
+                
+                # Check for profile validation mismatches
+                is_invoice_conflict = ("Invoice" in doc_mode or "Sale" in doc_mode) and (detected == "Bank Statement")
+                is_statement_conflict = (doc_mode == "Bank Statements") and (detected == "Invoice")
+                
+                if is_invoice_conflict or is_statement_conflict:
+                    show_gatekeeper_warning(detected, doc_mode)
+                    st.stop()
+            
+            # Reset confirmation variable flag for upcoming clicks
+            st.session_state["confirmed_execution"] = False
+            
+            # --- EXECUTION STAGE RUN ---
+            all_parsed_json_strings = []
             progress_bar = st.progress(0)
             status_text = st.empty()
             
@@ -257,25 +384,32 @@ else:
                 prompt_instruction = "Extract details from this sale bill/invoice. Look for the Customer or Buyer name and assign it to buyer_name. Identify the buyer's GSTIN/GST number for buyer_gst_number. Extract item grids carefully. Mark absent tax values as 0.0."
 
             for index, file in enumerate(uploaded_files):
+                # Calculate unique cryptographic MD5 fingerprint locally
                 file_bytes = file.getvalue()
                 file_hash = hashlib.md5(file_bytes).hexdigest()
                 
-                if file_hash in processed_file_hashes:
-                    status_text.text(f"🛑 Skipped Duplicate File: {file.name}")
-                    st.warning(f"⚠️ **{file.name}** is a duplicate file. Re-used previous extraction data to save tokens.")
-                    all_parsed_data.append(processed_file_hashes[file_hash])
+                # Check persistent SQL database cache to prevent re-spending on already extracted logs
+                cached_json = get_cached_extraction(file_hash, doc_mode)
+                if cached_json:
+                    status_text.text(f"💾 Loading from SQLite DB (0 Tokens Burned!): {file.name}")
+                    all_parsed_json_strings.append(cached_json)
                     progress_bar.progress((index + 1) / len(uploaded_files))
                     continue
                 
+                # Database check missed -> Run full pipeline call to Cloud AI
                 status_text.text(f"AI parsing document ({index+1}/{len(uploaded_files)}): {file.name}...")
                 try:
                     if "Gemini" in st.session_state["platform_choice"]:
-                        result = extract_with_gemini(file, st.session_state["saved_key"], chosen_schema, prompt_instruction)
+                        json_result_str = extract_with_gemini(file, st.session_state["saved_key"], chosen_schema, prompt_instruction)
                     else:
-                        result = extract_with_openai(file, st.session_state["saved_key"], chosen_schema, prompt_instruction)
+                        json_result_str = extract_with_openai(file, st.session_state["saved_key"], chosen_schema, prompt_instruction)
                     
-                    all_parsed_data.append(result)
-                    processed_file_hashes[file_hash] = result
+                    # Validate JSON structure sanity check
+                    json.loads(json_result_str)
+                    
+                    # Immediately record data to persistent SQLite database storage
+                    save_extraction_to_db(file_hash, file.name, doc_mode, json_result_str)
+                    all_parsed_json_strings.append(json_result_str)
                     
                 except Exception as e:
                     st.error(f"Error handling processing pipeline on '{file.name}': {e}")
@@ -284,13 +418,9 @@ else:
                 
             status_text.text("✨ Conversions complete! Structuring master data reports...")
             
-            if all_parsed_data:
-                final_df = compile_to_dataframe(all_parsed_data, doc_mode)
+            if all_parsed_json_strings:
+                final_df = compile_to_dataframe(all_parsed_json_strings, doc_mode)
                 
-                # Note: We do not call drop_duplicates on the whole dataframe here,
-                # because the line items themselves are distinct. Our compile logic
-                # handles voucher total safety cleanly.
-
                 st.success(f"🎉 Integrated {doc_mode} Ledger Master Report Generated Successfully!")
                 st.subheader("📋 Consolidated Live Preview Window")
                 st.dataframe(final_df, use_container_width=True)
